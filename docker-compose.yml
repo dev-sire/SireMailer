@@ -1,0 +1,12 @@
+services:
+  backend:
+    build: ./backend
+    restart: unless-stopped
+    volumes:
+      - ./data:/data          # database + encryption key live here; back this folder up
+  frontend:
+    build: ./frontend
+    restart: unless-stopped
+    depends_on: [backend]
+    ports:
+      - "127.0.0.1:3000:3000" # local only: the app has no login

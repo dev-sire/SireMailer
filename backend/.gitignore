@@ -1,0 +1,14 @@
+# Sensitive environment variables
+.venv
+
+data
+
+# SQLite databases
+*.db
+*.sqlite
+instance/
+
+# Python cache
+__pycache__/
+# VSCode settings
+.vscode/
