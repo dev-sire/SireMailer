@@ -40,7 +40,7 @@ Mails go out slowly and individually, the way a person would send them, which ke
 **Requirements:** Docker with Compose v2, and a Google account with 2-Step Verification enabled.
 
 ```bash
-git clone https://github.com/<your-username>/sire-mailer.git
+git clone https://github.com/dev-sire/SireMailer.git
 cd sire-mailer
 docker compose up -d --build
 ```
