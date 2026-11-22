@@ -11,6 +11,12 @@ export const post = (body) => ({
   method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
 });
 
+export const patch = (body) => ({
+  method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
+});
+
+export const card = "rounded-lg bg-white p-5 shadow-sm";
+
 export function fmt(s) {
   if (s == null) return "-";
   s = Math.max(0, Math.round(s));
@@ -61,5 +67,59 @@ export function Progress({ c, tall }) {
       <div className="bg-emerald-600 transition-all" style={{ width: `${pct(c.sent)}%` }} />
       <div className="bg-red-500 transition-all" style={{ width: `${pct(c.failed)}%` }} />
     </div>
+  );
+}
+
+export function Fld({ label, hint, className = "", children }) {
+  return (
+    <label className={`block text-sm font-medium ${className}`}>
+      {label}
+      <span className="mt-1 block">{children}</span>
+      {hint && <span className="mt-1 block text-xs font-normal text-slate-500">{hint}</span>}
+    </label>
+  );
+}
+
+// Reply-To, CC and BCC fields, shared by the new-campaign and campaign pages.
+export function Delivery({ form, set }) {
+  return (
+    <>
+      <Fld label="Reply-To (optional)" className="sm:col-span-2" hint="Replies go here instead of the sender address.">
+        <input type="email" className={input} value={form.reply_to} onChange={set("reply_to")} placeholder="team@yourdomain.com" />
+      </Fld>
+      <Fld label="CC (optional)" hint="Separate several addresses with commas. Copied on every mail.">
+        <input className={input} value={form.cc} onChange={set("cc")} />
+      </Fld>
+      <Fld label="BCC (optional)" hint="Hidden copy on every mail. CC and BCC count toward Gmail's daily limit.">
+        <input className={input} value={form.bcc} onChange={set("bcc")} />
+      </Fld>
+    </>
+  );
+}
+
+const SAMPLE = { name: "Ayesha Khan", first_name: "Ayesha", email: "ayesha@example.com" };
+const fill = (t = "") => t.replace(/\{\{\s*(\w+)\s*\}\}/g, (_, k) => SAMPLE[k.toLowerCase()] ?? "");
+
+// Large live preview. Renders unsaved edits, so changes can be reviewed before saving.
+export function Preview({ template, subject, className = "" }) {
+  const [mobile, setMobile] = useState(false);
+  const tab = (on) => `rounded px-3 py-1 text-xs font-medium ${on ? "bg-white shadow-sm" : "text-slate-600"}`;
+  return (
+    <section className={`flex flex-col overflow-hidden rounded-lg bg-white shadow-sm ${className}`}>
+      <div className="flex items-center justify-between gap-3 border-b border-slate-100 px-4 py-3">
+        <div className="min-w-0">
+          <p className="text-xs text-slate-500">Live preview as {SAMPLE.name}</p>
+          <p className="truncate text-sm font-medium">{fill(subject) || "(no subject yet)"}</p>
+        </div>
+        <div className="flex shrink-0 rounded-md bg-slate-100 p-0.5">
+          <button type="button" onClick={() => setMobile(false)} className={tab(!mobile)}>Desktop</button>
+          <button type="button" onClick={() => setMobile(true)} className={tab(mobile)}>Mobile</button>
+        </div>
+      </div>
+      <div className="min-h-0 flex-1 bg-slate-100 p-3">
+        <iframe title="Template preview" sandbox="" srcDoc={fill(template)}
+          className={`mx-auto block h-full w-full rounded bg-white transition-all ${mobile ? "max-w-[390px]" : ""}`} />
+      </div>
+    </section>
   );
 }
