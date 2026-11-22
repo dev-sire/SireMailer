@@ -64,6 +64,11 @@ def x(sql, args=()):
 with closing(db()) as _c:
     _c.executescript(SCHEMA)
     _c.execute("PRAGMA journal_mode=WAL")
+    _have = {r["name"] for r in _c.execute("PRAGMA table_info(campaigns)")}
+    for _col in ("cc", "bcc", "reply_to"):
+        if _col not in _have:
+            _c.execute(f"ALTER TABLE campaigns ADD COLUMN {_col} TEXT DEFAULT ''")
+    _c.commit()
 # A restart kills any sending thread, so anything still marked running was interrupted.
 x("UPDATE campaigns SET status='paused', message='Interrupted by a restart. Resume to continue.' WHERE status='running'")
 
@@ -101,6 +106,16 @@ def read_recipients(raw):
     return out, skipped
 
 
+def parse_addrs(raw, label, single=False):
+    items = [i for i in re.split(r"[;,\s]+", raw or "") if i]
+    for i in items:
+        if not EMAIL_RE.match(i):
+            raise ValueError(f"{label}: '{i}' is not a valid email address")
+    if single and len(items) > 1:
+        raise ValueError(f"{label} takes a single address")
+    return ", ".join(items)
+
+
 def build_mailer(email, password):
     mini = Flask(f"mailer-{uuid.uuid4().hex}")
     mini.config.update(MAIL_SERVER="smtp.gmail.com", MAIL_PORT=587, MAIL_USE_TLS=True,
@@ -123,14 +138,18 @@ def password_of(a):
     return FERNET.decrypt(a["password_enc"]).decode()
 
 
-def build_message(c, a, name, email):
+def build_message(c, a, name, email, test=False):
     ctx = {"name": name, "first_name": name.split()[0], "email": email}
     body = render(c["template"], ctx)
+    reply = c["reply_to"] or a["email"]
+    # A test goes only to the sender, so CC/BCC contacts aren't copied on it.
+    cc = [] if test else [i for i in (c["cc"] or "").split(", ") if i]
+    bcc = [] if test else [i for i in (c["bcc"] or "").split(", ") if i]
     msg = Message(
         subject=render(c["subject"], ctx, False),
         sender=(a["sender_name"], a["email"]) if a["sender_name"] else a["email"],
-        recipients=[(name, email)], body=html_to_text(body), html=body, reply_to=a["email"],
-        extra_headers={"List-Unsubscribe": f"<mailto:{a['email']}?subject=unsubscribe>"})
+        recipients=[(name, email)], cc=cc, bcc=bcc, body=html_to_text(body), html=body, reply_to=reply,
+        extra_headers={"List-Unsubscribe": f"<mailto:{reply}?subject=unsubscribe>"})
     msg.msgId = make_msgid(domain=a["email"].split("@")[1])
     return msg
 
@@ -242,6 +261,40 @@ def save_account():
     return jsonify(ok=True), 201
 
 
+@app.patch("/api/accounts/<int:aid>")
+def edit_account(aid):
+    a = q("SELECT * FROM accounts WHERE id=?", (aid,), True)
+    if not a:
+        return jsonify(error="Sender not found"), 404
+    d = request.get_json(silent=True) or {}
+    email = (d.get("email") or a["email"]).strip()
+    pw = (d.get("password") or "").replace(" ", "")
+    name = (d.get("sender_name", a["sender_name"]) or "").strip()
+    try:
+        limit = max(1, int(d.get("daily_limit") or a["daily_limit"]))
+    except ValueError:
+        return jsonify(error="Daily limit must be a number"), 400
+    if not EMAIL_RE.match(email):
+        return jsonify(error="Enter a valid Gmail address"), 400
+    if email != a["email"]:
+        if q("SELECT 1 FROM accounts WHERE email=? AND id!=?", (email, aid), True):
+            return jsonify(error="Another sender already uses that address"), 409
+        if not pw:
+            return jsonify(error="Enter the app password for the new address"), 400
+    for cid in list(RUNS):
+        row = q("SELECT account_id FROM campaigns WHERE id=?", (cid,), True)
+        if row and row["account_id"] == aid:
+            return jsonify(error="A campaign is sending from this sender. Pause it first."), 409
+    enc = a["password_enc"]
+    if pw:
+        problem = check_login(*build_mailer(email, pw))
+        if problem:
+            return jsonify(error=problem), 400
+        enc = FERNET.encrypt(pw.encode())
+    x("UPDATE accounts SET email=?, sender_name=?, password_enc=?, daily_limit=? WHERE id=?", (email, name, enc, limit, aid))
+    return jsonify(ok=True)
+
+
 @app.delete("/api/accounts/<int:aid>")
 def delete_account(aid):
     if q("SELECT 1 FROM campaigns WHERE account_id=?", (aid,), True):
@@ -268,11 +321,13 @@ def create_campaign():
         return jsonify(error="Choose a sender"), 400
     try:
         delay = min(max(float(f.get("delay") or 5), 2.0), 120.0)
+        cc, bcc = parse_addrs(f.get("cc"), "CC"), parse_addrs(f.get("bcc"), "BCC")
+        reply = parse_addrs(f.get("reply_to"), "Reply-To", single=True)
         people, skipped = read_recipients(upload.read())
     except ValueError as e:
         return jsonify(error=str(e)), 400
-    cid = x("INSERT INTO campaigns(name, account_id, subject, template, delay, created_at) VALUES(?,?,?,?,?,?)",
-            (name, f["account_id"], subject, template, delay, time.time()))
+    cid = x("INSERT INTO campaigns(name, account_id, subject, template, delay, cc, bcc, reply_to, created_at) VALUES(?,?,?,?,?,?,?,?,?)",
+            (name, f["account_id"], subject, template, delay, cc, bcc, reply, time.time()))
     with closing(db()) as c:
         c.executemany("INSERT OR IGNORE INTO recipients(campaign_id, name, email) VALUES(?,?,?)",
                       [(cid, n, e) for n, e in people])
@@ -286,10 +341,72 @@ def campaign_detail(cid):
     if not c:
         return jsonify(error="Campaign not found"), 404
     d = view(c)
-    d["template"] = c["template"]
+    d.update(template=c["template"], account_id=c["account_id"], cc=c["cc"] or "", bcc=c["bcc"] or "", reply_to=c["reply_to"] or "")
     d["failures"] = [dict(r) for r in q("SELECT email, error FROM recipients WHERE campaign_id=? AND status='failed' LIMIT 100", (cid,))]
     d["recent"] = [dict(r) for r in q("SELECT email, sent_at FROM recipients WHERE campaign_id=? AND status='sent' ORDER BY sent_at DESC LIMIT 8", (cid,))]
     return jsonify(d)
+
+
+@app.patch("/api/campaigns/<int:cid>")
+def edit_campaign(cid):
+    c = get_campaign(cid)
+    if not c:
+        return jsonify(error="Campaign not found"), 404
+    if cid in RUNS:
+        return jsonify(error="Pause the campaign before editing it"), 409
+    d = request.get_json(silent=True) or {}
+    name, subject = (d.get("name", c["name"]) or "").strip(), (d.get("subject", c["subject"]) or "").strip()
+    template = d.get("template", c["template"]) or ""
+    if not (name and subject and template.strip()):
+        return jsonify(error="Name, subject and template can't be empty"), 400
+    try:
+        delay = min(max(float(d.get("delay", c["delay"])), 2.0), 120.0)
+        aid = int(d.get("account_id", c["account_id"]))
+    except (TypeError, ValueError):
+        return jsonify(error="Delay must be a number and a sender must be chosen"), 400
+    if not q("SELECT 1 FROM accounts WHERE id=?", (aid,), True):
+        return jsonify(error="Choose a sender"), 400
+    try:
+        cc, bcc = parse_addrs(d.get("cc", c["cc"]), "CC"), parse_addrs(d.get("bcc", c["bcc"]), "BCC")
+        reply = parse_addrs(d.get("reply_to", c["reply_to"]), "Reply-To", single=True)
+    except ValueError as e:
+        return jsonify(error=str(e)), 400
+    x("UPDATE campaigns SET name=?, account_id=?, subject=?, template=?, delay=?, cc=?, bcc=?, reply_to=? WHERE id=?",
+      (name, aid, subject, template, delay, cc, bcc, reply, cid))
+    return jsonify(ok=True)
+
+
+@app.post("/api/campaigns/<int:cid>/recipients")
+def update_recipients(cid):
+    """mode=add keeps everyone and adds new addresses; mode=replace also removes unsent ones missing from the file.
+    Contacts already mailed are never removed or re-sent."""
+    c = get_campaign(cid)
+    if not c:
+        return jsonify(error="Campaign not found"), 404
+    if cid in RUNS:
+        return jsonify(error="Pause the campaign before changing its recipients"), 409
+    upload = request.files.get("csv")
+    if not upload:
+        return jsonify(error="Upload a CSV file"), 400
+    try:
+        people, skipped = read_recipients(upload.read())
+    except ValueError as e:
+        return jsonify(error=str(e)), 400
+    with closing(db()) as conn:
+        have = {r["email"].lower() for r in conn.execute("SELECT email FROM recipients WHERE campaign_id=?", (cid,))}
+        new = [(cid, n, e) for n, e in people if e.lower() not in have]
+        conn.executemany("INSERT OR IGNORE INTO recipients(campaign_id, name, email) VALUES(?,?,?)", new)
+        removed = 0
+        if request.form.get("mode") == "replace":
+            keep = {e.lower() for _, e in people}
+            ids = [(r["id"],) for r in conn.execute("SELECT id, email FROM recipients WHERE campaign_id=? AND status!='sent'", (cid,))
+                   if r["email"].lower() not in keep]
+            conn.executemany("DELETE FROM recipients WHERE id=?", ids)
+            removed = len(ids)
+        if new and c["status"] == "done":  # new people to mail, so the campaign is no longer finished
+            conn.execute("UPDATE campaigns SET status='paused', finished_at=NULL WHERE id=?", (cid,))
+        conn.commit()
+    return jsonify(added=len(new), removed=removed, skipped=skipped, existing=len(people) - len(new))
 
 
 @app.post("/api/campaigns/<int:cid>/start")
@@ -331,7 +448,7 @@ def test_campaign(cid):
     mini, mail = build_mailer(a["email"], password_of(a))
     try:
         with mini.app_context(), mail.connect() as conn:
-            conn.send(build_message(c, a, "Test Participant", a["email"]))
+            conn.send(build_message(c, a, "Test Participant", a["email"], test=True))
     except Exception as e:
         return jsonify(error=str(e)[:200]), 400
     return jsonify(ok=True, to=a["email"])
